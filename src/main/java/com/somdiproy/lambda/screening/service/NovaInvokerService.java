@@ -2,18 +2,20 @@ package com.somdiproy.lambda.screening.service;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import org.apache.http.client.methods.CloseableHttpResponse;
-import org.apache.http.client.methods.HttpPost;
-import org.apache.http.entity.StringEntity;
-import org.apache.http.impl.client.CloseableHttpClient;
-import org.apache.http.impl.client.HttpClients;
-import org.apache.http.util.EntityUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.time.Instant;
 import java.util.*;
+
+import software.amazon.awssdk.auth.credentials.DefaultCredentialsProvider;
+import software.amazon.awssdk.core.SdkBytes;
+import software.amazon.awssdk.core.exception.SdkClientException;
+import software.amazon.awssdk.core.exception.SdkServiceException;
+import software.amazon.awssdk.regions.Region;
+import software.amazon.awssdk.services.bedrockruntime.BedrockRuntimeClient;
+import software.amazon.awssdk.services.bedrockruntime.model.*;
 
 /**
  * Service for invoking Amazon Nova models via Bedrock API
@@ -24,7 +26,6 @@ public class NovaInvokerService {
     private static final Logger logger = LoggerFactory.getLogger(NovaInvokerService.class);
     
     private final ObjectMapper objectMapper = new ObjectMapper();
-    private final CloseableHttpClient httpClient;
     private final String bedrockRegion;
     private final Map<String, Long> lastCallTime = new HashMap<>();
     private final Map<String, Integer> callCount = new HashMap<>();
@@ -36,7 +37,6 @@ public class NovaInvokerService {
     
     public NovaInvokerService(String bedrockRegion) {
         this.bedrockRegion = bedrockRegion != null ? bedrockRegion : "us-east-1";
-        this.httpClient = HttpClients.createDefault();
     }
     
     /**
@@ -57,7 +57,7 @@ public class NovaInvokerService {
      * Invoke Nova Premier model for suggestion generation
      */
     public NovaResponse invokeNovaPremier(String prompt, NovaRequest request) throws NovaInvokerException {
-        return invokeNova("us.amazon.nova-premier-v1:0", prompt, request, 8000);
+        return invokeNova("us.amazon.nova-pro-v1:0", prompt, request, 8000);
     }
     
     /**
@@ -97,10 +97,7 @@ public class NovaInvokerService {
                                                    NovaRequest request, int maxTokens) {
         Map<String, Object> payload = new HashMap<>();
         
-        // Basic model parameters
-        payload.put("modelId", modelId);
-        
-        // Message structure for Nova models
+        // Message structure for Nova models (not including modelId in payload)
         List<Map<String, Object>> messages = new ArrayList<>();
         Map<String, Object> message = new HashMap<>();
         message.put("role", "user");
@@ -130,76 +127,124 @@ public class NovaInvokerService {
         return payload;
     }
     
-    /**
-     * Make Bedrock API call with retry logic
-     */
     private NovaResponse callBedrockWithRetries(String modelId, Map<String, Object> payload) 
             throws NovaInvokerException {
         
-        String endpoint = String.format("https://bedrock-runtime.%s.amazonaws.com/model/%s/converse", 
-                                       bedrockRegion, modelId);
-        
         Exception lastException = null;
+        
+        // Initialize AWS SDK client
+        BedrockRuntimeClient bedrockClient = BedrockRuntimeClient.builder()
+                .region(Region.of(bedrockRegion))
+                .credentialsProvider(DefaultCredentialsProvider.create())
+                .build();
         
         for (int attempt = 1; attempt <= MAX_RETRIES; attempt++) {
             try {
                 logger.debug("Attempt {} to call Nova model {}", attempt, modelId);
                 
-                HttpPost request = new HttpPost(endpoint);
-                request.setHeader("Content-Type", "application/json");
-                request.setHeader("Accept", "application/json");
-                
-                // AWS Signature V4 would be handled by AWS SDK in production
-                // For now, using environment-based authentication
-                
+                // Convert payload to JSON
                 String jsonPayload = objectMapper.writeValueAsString(payload);
-                request.setEntity(new StringEntity(jsonPayload));
                 
-                try (CloseableHttpResponse response = httpClient.execute(request)) {
-                    int statusCode = response.getStatusLine().getStatusCode();
-                    String responseBody = EntityUtils.toString(response.getEntity());
-                    
-                    if (statusCode == 200) {
-                        return parseNovaResponse(responseBody, modelId);
-                    } else if (statusCode == 429) {
-                        // Rate limit exceeded
-                        logger.warn("Rate limit exceeded for {}, attempt {}", modelId, attempt);
-                        if (attempt < MAX_RETRIES) {
-                            Thread.sleep(RETRY_DELAY_MS * attempt);
-                            continue;
-                        }
-                    } else if (statusCode >= 500) {
-                        // Server error, retry
-                        logger.warn("Server error {} for {}, attempt {}", statusCode, modelId, attempt);
-                        if (attempt < MAX_RETRIES) {
-                            Thread.sleep(RETRY_DELAY_MS);
-                            continue;
-                        }
-                    }
-                    
-                    throw new NovaInvokerException(
-                        String.format("Bedrock API call failed: %d - %s", statusCode, responseBody));
-                }
+                // Create AWS SDK request
+                InvokeModelRequest invokeRequest = InvokeModelRequest.builder()
+                        .modelId(modelId)
+                        .contentType("application/json")
+                        .accept("application/json")
+                        .body(SdkBytes.fromUtf8String(jsonPayload))
+                        .build();
                 
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                throw new NovaInvokerException("Nova invocation interrupted", e);
-            } catch (IOException e) {
+                // Make the API call using AWS SDK
+                InvokeModelResponse response = bedrockClient.invokeModel(invokeRequest);
+                
+                // Parse response
+                String responseBody = response.body().asUtf8String();
+                return parseNovaResponse(responseBody, modelId);
+                
+            } catch (ResourceNotFoundException e) {
+                // Model not found - don't retry
+                throw new NovaInvokerException("Model not found: " + modelId, e);
+            } catch (AccessDeniedException e) {
+                // Permission issue - don't retry
+                throw new NovaInvokerException("Access denied to model: " + modelId, e);
+            } catch (ValidationException e) {
+                // Invalid request - don't retry
+                throw new NovaInvokerException("Invalid request: " + e.getMessage(), e);
+            } catch (ThrottlingException e) {
+                // Rate limit exceeded - retry with backoff
+                logger.warn("Rate limit exceeded for {}, attempt {}", modelId, attempt);
                 lastException = e;
-                logger.warn("Network error on attempt {} for {}: {}", attempt, modelId, e.getMessage());
-                
+                if (attempt < MAX_RETRIES) {
+                    try {
+                        Thread.sleep(RETRY_DELAY_MS * attempt);
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        throw new NovaInvokerException("Interrupted during retry", ie);
+                    }
+                }
+            } catch (ModelTimeoutException e) {
+                // Model timeout - retry
+                logger.warn("Model timeout for {}, attempt {}", modelId, attempt);
+                lastException = e;
                 if (attempt < MAX_RETRIES) {
                     try {
                         Thread.sleep(RETRY_DELAY_MS);
                     } catch (InterruptedException ie) {
                         Thread.currentThread().interrupt();
-                        throw new NovaInvokerException("Nova invocation interrupted", ie);
+                        throw new NovaInvokerException("Interrupted during retry", ie);
                     }
                 }
-            } catch (Exception e) {
+            } catch (BedrockRuntimeException e) {
+                // General Bedrock service error
+                logger.warn("Bedrock service error for {}, attempt {}: {}", modelId, attempt, e.getMessage());
                 lastException = e;
-                logger.error("Unexpected error on attempt {} for {}: {}", attempt, modelId, e.getMessage());
-                break; // Don't retry on unexpected errors
+                
+                // Retry on 5xx errors or throttling
+                if (attempt < MAX_RETRIES && (e.statusCode() >= 500 || e.statusCode() == 429)) {
+                    try {
+                        Thread.sleep(RETRY_DELAY_MS);
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        throw new NovaInvokerException("Interrupted during retry", ie);
+                    }
+                } else {
+                    throw new NovaInvokerException("Bedrock service error: " + e.getMessage(), e);
+                }
+            } catch (SdkServiceException e) {
+                // AWS service error - check status code
+                logger.error("AWS service error for {}: {}", modelId, e.getMessage());
+                
+                // Retry on 5xx errors
+                if (attempt < MAX_RETRIES && e.statusCode() >= 500) {
+                    lastException = e;
+                    try {
+                        Thread.sleep(RETRY_DELAY_MS);
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        throw new NovaInvokerException("Interrupted during retry", ie);
+                    }
+                } else {
+                    throw new NovaInvokerException("AWS service error: " + e.getMessage(), e);
+                }
+            } catch (SdkClientException e) {
+                // Client-side error (network, config, etc.)
+                logger.error("Client error for {}: {}", modelId, e.getMessage());
+                lastException = e;
+                
+                // Retry on network errors
+                if (attempt < MAX_RETRIES) {
+                    try {
+                        Thread.sleep(RETRY_DELAY_MS);
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        throw new NovaInvokerException("Interrupted during retry", ie);
+                    }
+                } else {
+                    throw new NovaInvokerException("Client error: " + e.getMessage(), e);
+                }
+            } catch (Exception e) {
+                // Unexpected error - don't retry
+                logger.error("Unexpected error for {}: {}", modelId, e.getMessage());
+                throw new NovaInvokerException("Unexpected error: " + e.getMessage(), e);
             }
         }
         
@@ -261,6 +306,7 @@ public class NovaInvokerService {
             case "us.amazon.nova-lite-v1:0":
                 costPer1MTokens = 0.015; // $0.015 per 1M tokens
                 break;
+            case "us.amazon.nova-pro-v1:0":
             case "us.amazon.nova-premier-v1:0":
                 costPer1MTokens = 0.80; // $0.80 per 1M tokens
                 break;
@@ -305,19 +351,6 @@ public class NovaInvokerService {
     public void resetStatistics() {
         callCount.clear();
         lastCallTime.clear();
-    }
-    
-    /**
-     * Close HTTP client resources
-     */
-    public void close() {
-        try {
-            if (httpClient != null) {
-                httpClient.close();
-            }
-        } catch (IOException e) {
-            logger.error("Error closing HTTP client: {}", e.getMessage());
-        }
     }
     
     /**

@@ -14,11 +14,6 @@ import java.util.*;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
-import org.apache.http.client.methods.CloseableHttpResponse;
-import org.apache.http.client.methods.HttpPost;
-import org.apache.http.entity.StringEntity;
-import org.apache.http.util.EntityUtils;
-
 /**
  * Lambda function for Nova Micro file screening and filtering
  * First tier of the three-tier analysis system
@@ -82,8 +77,8 @@ public class ScreeningHandler implements RequestHandler<ScreeningRequest, Screen
             List<ScreeningResponse.ScreenedFile> screenedFiles = performNovaScreening(candidates, logger);
             
             // Stage 3: Generate summary and metrics
-            ScreeningResponse.ScreeningSummary summary = generateSummary(files, screenedFiles);
-            ScreeningResponse.TokenUsage tokenUsage = calculateTokenUsage(screenedFiles);
+            ScreeningResponse.ScreeningSummary summary = generateSummary(files, candidates, screenedFiles);
+            ScreeningResponse.TokenUsage tokenUsage = calculateTokenUsageForFiles(screenedFiles);
             
             processingTime.markEnd();
             
@@ -108,19 +103,6 @@ public class ScreeningHandler implements RequestHandler<ScreeningRequest, Screen
             errorResponse.setProcessingTime(processingTime);
             return errorResponse;
         }
-    }
-    
-    /**
-     * Parse file information from input
-     */
-    private FileCandidate parseFileFromInput(Map<String, Object> fileData) {
-        return new FileCandidate(
-            (String) fileData.get("path"),
-            (String) fileData.get("name"),
-            (String) fileData.get("content"),
-            ((Number) fileData.get("size")).longValue(),
-            (String) fileData.get("language")
-        );
     }
     
     /**
@@ -155,7 +137,7 @@ public class ScreeningHandler implements RequestHandler<ScreeningRequest, Screen
         for (ScreeningRequest.FileInput candidate : candidates) {
             try {
                 String optimizedContent = TokenOptimizer.optimizeForScreening(candidate.getContent(), 
-                    candidate.getLanguage() != null ? candidate.getLanguage() : detectLanguageFromExtension(candidate.getPath()));
+                    candidate.getLanguage() != null ? candidate.getLanguage() : mapExtensionToLanguage(getFileExtension(candidate.getPath())));
                 
                 ScreeningResult result = callNovaMicro(candidate, optimizedContent, logger);
                 
@@ -188,37 +170,15 @@ public class ScreeningHandler implements RequestHandler<ScreeningRequest, Screen
     }
     
     /**
-     * Optimize content for Nova Micro analysis (token reduction)
-     */
-    private String optimizeContentForScreening(String content) {
-        if (content == null || content.isEmpty()) {
-            return "";
-        }
-        
-        // Remove comments and extra whitespace for screening
-        String optimized = content
-            .replaceAll("/\\*.*?\\*/", "") // Remove block comments
-            .replaceAll("//.*", "") // Remove line comments
-            .replaceAll("#.*", "") // Remove Python/shell comments
-            .replaceAll("\\s+", " ") // Collapse whitespace
-            .trim();
-        
-        // Limit to first 1000 characters for screening
-        return optimized.length() > 1000 ? optimized.substring(0, 1000) : optimized;
-    }
-    
-    /**
      * Call Nova Micro model for content analysis
      */
     private ScreeningResult callNovaMicro(ScreeningRequest.FileInput file, String optimizedContent, LambdaLogger logger) {
         try {
             String prompt = buildScreeningPrompt(file, optimizedContent);
             
-            NovaInvokerService.NovaRequest request = NovaInvokerService.NovaRequest.builder()
-                .temperature(0.1)
-                .topP(0.9);
             
-            NovaInvokerService.NovaResponse response = novaInvoker.invokeNovaMicro(prompt, request);
+            
+            NovaInvokerService.NovaResponse response = novaInvoker.invokeNovaMicro(prompt, null);
             
             if (response.isSuccessful()) {
                 return parseNovaResponse(response.getResponseText(), file);
@@ -229,6 +189,37 @@ public class ScreeningHandler implements RequestHandler<ScreeningRequest, Screen
             
         } catch (Exception e) {
             logger.log("❌ Nova Micro call failed for " + file.getPath() + ": " + e.getMessage());
+            return createFallbackResult(file);
+        }
+    }
+    
+    /**
+     * Parse Nova response into screening result
+     */
+    private ScreeningResult parseNovaResponse(String responseText, ScreeningRequest.FileInput file) {
+        try {
+            // Parse structured response
+            String text = responseText.toLowerCase();
+            
+            // Extract values from response
+            String language = extractValue(text, "language:");
+            String confidenceStr = extractValue(text, "confidence:");
+            float confidence = 0.8f; // default
+            
+            // Handle percentage or decimal format
+            if (confidenceStr.contains("%")) {
+                confidence = Float.parseFloat(confidenceStr.replace("%", "")) / 100;
+            } else {
+                confidence = Float.parseFloat(confidenceStr);
+            }
+            
+            String complexity = extractValue(text, "complexity:");
+            boolean isValid = text.contains("valid: yes") || text.contains("valid source code: yes");
+            
+            return new ScreeningResult(isValid, language, confidence, complexity);
+            
+        } catch (Exception e) {
+            // Fallback to extension-based detection
             return createFallbackResult(file);
         }
     }
@@ -271,65 +262,16 @@ public class ScreeningHandler implements RequestHandler<ScreeningRequest, Screen
     }
     
     /**
-     * Call Bedrock API
-     */
-    private String callBedrockAPI(Map<String, Object> requestBody) throws Exception {
-        String endpoint = String.format("https://bedrock-runtime.%s.amazonaws.com/model/%s/converse", 
-                                       BEDROCK_REGION, MODEL_ID);
-        
-        HttpPost request = new HttpPost(endpoint);
-        request.setHeader("Content-Type", "application/json");
-        request.setHeader("Accept", "application/json");
-        
-        String json = objectMapper.writeValueAsString(requestBody);
-        request.setEntity(new StringEntity(json));
-        
-        try (CloseableHttpResponse response = httpClient.execute(request)) {
-            return EntityUtils.toString(response.getEntity());
-        }
-    }
-    
-    /**
-     * Parse Nova Micro response
-     */
-    private ScreeningResult parseNovaResponse(String response, FileCandidate file) {
-        try {
-            @SuppressWarnings("unchecked")
-            Map<String, Object> responseMap = objectMapper.readValue(response, Map.class);
-            
-            @SuppressWarnings("unchecked")
-            Map<String, Object> output = (Map<String, Object>) responseMap.get("output");
-            @SuppressWarnings("unchecked")
-            Map<String, Object> message = (Map<String, Object>) output.get("message");
-            @SuppressWarnings("unchecked")
-            List<Map<String, Object>> content = (List<Map<String, Object>>) message.get("content");
-            
-            String text = (String) content.get(0).get("text");
-            
-            // Parse the structured response
-            String language = extractValue(text, "LANGUAGE:");
-            float confidence = Float.parseFloat(extractValue(text, "CONFIDENCE:"));
-            String complexity = extractValue(text, "COMPLEXITY:");
-            boolean isValid = "yes".equalsIgnoreCase(extractValue(text, "VALID:"));
-            
-            return new ScreeningResult(isValid, language, confidence, complexity);
-            
-        } catch (Exception e) {
-            // Fallback: Use basic file extension detection
-            String extension = getFileExtension(file.path);
-            String language = mapExtensionToLanguage(extension);
-            return new ScreeningResult(true, language, 0.8f, "medium");
-        }
-    }
-    
-    /**
      * Extract value from structured response
      */
     private String extractValue(String text, String key) {
         String[] lines = text.split("\n");
         for (String line : lines) {
-            if (line.startsWith(key)) {
-                return line.substring(key.length()).trim();
+            if (line.toLowerCase().contains(key.toLowerCase())) {
+                String[] parts = line.split(":");
+                if (parts.length > 1) {
+                    return parts[1].trim();
+                }
             }
         }
         return "unknown";
@@ -363,21 +305,69 @@ public class ScreeningHandler implements RequestHandler<ScreeningRequest, Screen
     }
     
     /**
+     * Generate summary statistics for the screening process
+     */
+    private ScreeningResponse.ScreeningSummary generateSummary(
+            List<ScreeningRequest.FileInput> inputFiles,
+            List<ScreeningRequest.FileInput> candidates, 
+            List<ScreeningResponse.ScreenedFile> screenedFiles) {
+        
+        ScreeningResponse.ScreeningSummary summary = new ScreeningResponse.ScreeningSummary();
+        summary.setInputFiles(inputFiles.size());
+        summary.setProcessedFiles(candidates.size());
+        summary.setValidFiles(screenedFiles.size());
+        summary.setSkippedFiles(inputFiles.size() - candidates.size());
+        summary.setErrorFiles(candidates.size() - screenedFiles.size());
+        
+        // Calculate language distribution
+        Map<String, Integer> langDist = new HashMap<>();
+        for (ScreeningResponse.ScreenedFile file : screenedFiles) {
+            langDist.merge(file.getLanguage(), 1, Integer::sum);
+        }
+        summary.setLanguageDistribution(langDist);
+        
+        // Calculate complexity distribution  
+        Map<String, Integer> complexDist = new HashMap<>();
+        for (ScreeningResponse.ScreenedFile file : screenedFiles) {
+            complexDist.merge(file.getComplexity(), 1, Integer::sum);
+        }
+        summary.setComplexityDistribution(complexDist);
+        
+        // Calculate average confidence
+        float totalConfidence = 0;
+        for (ScreeningResponse.ScreenedFile file : screenedFiles) {
+            totalConfidence += file.getConfidence();
+        }
+        summary.setAverageConfidence(screenedFiles.isEmpty() ? 0 : totalConfidence / screenedFiles.size());
+        
+        // Calculate total size
+        long totalSize = screenedFiles.stream().mapToLong(ScreeningResponse.ScreenedFile::getSize).sum();
+        summary.setTotalSize(totalSize);
+        
+        return summary;
+    }
+    
+    /**
      * Calculate token usage for the screening process
      */
-    private Map<String, Object> calculateTokenUsage(List<ScreenedFile> files) {
-        int totalTokens = files.size() * 100; // Approximate tokens per file for screening
-        double cost = (totalTokens / 1_000_000.0) * 0.0075; // Nova Micro pricing
+    private ScreeningResponse.TokenUsage calculateTokenUsageForFiles(List<ScreeningResponse.ScreenedFile> files) {
+        int inputTokens = files.size() * 100; // Approximate tokens per file
+        int outputTokens = files.size() * 50; // Response tokens
+        double cost = ((inputTokens + outputTokens) / 1_000_000.0) * 0.0075; // Nova Micro pricing
         
-        Map<String, Object> usage = new HashMap<>();
-        usage.put("inputTokens", totalTokens);
-        usage.put("outputTokens", files.size() * 50); // Response tokens
-        usage.put("totalTokens", totalTokens + (files.size() * 50));
-        usage.put("estimatedCost", cost);
+        ScreeningResponse.TokenUsage usage = new ScreeningResponse.TokenUsage();
+        usage.setInputTokens(inputTokens);
+        usage.setOutputTokens(outputTokens);
+        usage.setTotalTokens(inputTokens + outputTokens);
+        usage.setEstimatedCost(cost);
+        usage.setModelCalls(files.size());
+        
         return usage;
     }
     
-    // Helper classes remain at bottom
+    /**
+     * Inner class for screening results
+     */
     private static class ScreeningResult {
         final boolean isValid;
         final String detectedLanguage;

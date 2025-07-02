@@ -1,24 +1,34 @@
 package com.somdiproy.lambda.screening.service;
 
-import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.io.IOException;
 import java.time.Instant;
 import java.util.*;
 
 import software.amazon.awssdk.auth.credentials.DefaultCredentialsProvider;
-import software.amazon.awssdk.core.SdkBytes;
 import software.amazon.awssdk.core.exception.SdkClientException;
 import software.amazon.awssdk.core.exception.SdkServiceException;
 import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.bedrockruntime.BedrockRuntimeClient;
-import software.amazon.awssdk.services.bedrockruntime.model.*;
+import software.amazon.awssdk.services.bedrockruntime.model.AccessDeniedException;
+import software.amazon.awssdk.services.bedrockruntime.model.BedrockRuntimeException;
+import software.amazon.awssdk.services.bedrockruntime.model.ContentBlock;
+import software.amazon.awssdk.services.bedrockruntime.model.ConversationRole;
+import software.amazon.awssdk.services.bedrockruntime.model.ConverseOutput;
+import software.amazon.awssdk.services.bedrockruntime.model.ConverseRequest;
+import software.amazon.awssdk.services.bedrockruntime.model.ConverseResponse;
+import software.amazon.awssdk.services.bedrockruntime.model.InferenceConfiguration;
+import software.amazon.awssdk.services.bedrockruntime.model.Message;
+import software.amazon.awssdk.services.bedrockruntime.model.ModelTimeoutException;
+import software.amazon.awssdk.services.bedrockruntime.model.ResourceNotFoundException;
+import software.amazon.awssdk.services.bedrockruntime.model.ThrottlingException;
+import software.amazon.awssdk.services.bedrockruntime.model.TokenUsage;
+import software.amazon.awssdk.services.bedrockruntime.model.ValidationException;
 
 /**
- * Service for invoking Amazon Nova models via Bedrock API
+ * Service for invoking Amazon Nova models via Bedrock Converse API
  * Handles authentication, rate limiting, and response parsing
  */
 public class NovaInvokerService {
@@ -72,11 +82,8 @@ public class NovaInvokerService {
             // Rate limiting
             enforceRateLimit(callKey);
             
-            // Build request payload
-            Map<String, Object> payload = buildRequestPayload(modelId, prompt, request, maxTokens);
-            
-            // Make API call with retries
-            NovaResponse response = callBedrockWithRetries(modelId, payload);
+            // Make API call with retries using Converse API
+            NovaResponse response = callBedrockWithRetries(modelId, prompt, request, maxTokens);
             
             // Track metrics
             updateCallMetrics(callKey);
@@ -91,43 +98,10 @@ public class NovaInvokerService {
     }
     
     /**
-     * Build the request payload for Bedrock API
+     * Call Bedrock with retries using Converse API
      */
-    private Map<String, Object> buildRequestPayload(String modelId, String prompt, 
-                                                   NovaRequest request, int maxTokens) {
-        Map<String, Object> payload = new HashMap<>();
-        
-        // Message structure for Nova models (not including modelId in payload)
-        List<Map<String, Object>> messages = new ArrayList<>();
-        Map<String, Object> message = new HashMap<>();
-        message.put("role", "user");
-        
-        List<Map<String, Object>> content = new ArrayList<>();
-        Map<String, Object> textContent = new HashMap<>();
-        textContent.put("text", prompt);
-        content.add(textContent);
-        
-        message.put("content", content);
-        messages.add(message);
-        payload.put("messages", messages);
-        
-        // Inference configuration
-        Map<String, Object> inferenceConfig = new HashMap<>();
-        inferenceConfig.put("maxTokens", maxTokens);
-        inferenceConfig.put("temperature", request != null ? request.getTemperature() : 0.1);
-        inferenceConfig.put("topP", request != null ? request.getTopP() : 0.9);
-        
-        payload.put("inferenceConfig", inferenceConfig);
-        
-        // Additional configuration if provided
-        if (request != null && request.getStopSequences() != null) {
-            inferenceConfig.put("stopSequences", request.getStopSequences());
-        }
-        
-        return payload;
-    }
-    
-    private NovaResponse callBedrockWithRetries(String modelId, Map<String, Object> payload) 
+    private NovaResponse callBedrockWithRetries(String modelId, String prompt, 
+                                               NovaRequest request, int maxTokens) 
             throws NovaInvokerException {
         
         Exception lastException = null;
@@ -140,25 +114,44 @@ public class NovaInvokerService {
         
         for (int attempt = 1; attempt <= MAX_RETRIES; attempt++) {
             try {
-                logger.debug("Attempt {} to call Nova model {}", attempt, modelId);
+                logger.debug("Attempt {} to call Nova model {} using Converse API", attempt, modelId);
                 
-                // Convert payload to JSON
-                String jsonPayload = objectMapper.writeValueAsString(payload);
-                
-                // Create AWS SDK request
-                InvokeModelRequest invokeRequest = InvokeModelRequest.builder()
-                        .modelId(modelId)
-                        .contentType("application/json")
-                        .accept("application/json")
-                        .body(SdkBytes.fromUtf8String(jsonPayload))
+                // Create message content
+                ContentBlock contentBlock = ContentBlock.builder()
+                        .text(prompt)
                         .build();
                 
-                // Make the API call using AWS SDK
-                InvokeModelResponse response = bedrockClient.invokeModel(invokeRequest);
+                // Create user message
+                Message userMessage = Message.builder()
+                        .role(ConversationRole.USER)
+                        .content(contentBlock)
+                        .build();
+                
+                // Create inference configuration
+                InferenceConfiguration.Builder inferenceConfigBuilder = InferenceConfiguration.builder()
+                        .maxTokens(maxTokens)
+                        .temperature(request != null ? (float) request.getTemperature() : 0.1f)
+                        .topP(request != null ? (float) request.getTopP() : 0.9f);
+                
+                // Add stop sequences if provided
+                if (request != null && request.getStopSequences() != null && !request.getStopSequences().isEmpty()) {
+                    inferenceConfigBuilder.stopSequences(request.getStopSequences());
+                }
+                
+                InferenceConfiguration inferenceConfig = inferenceConfigBuilder.build();
+                
+                // Create Converse request
+                ConverseRequest converseRequest = ConverseRequest.builder()
+                        .modelId(modelId)
+                        .messages(userMessage)
+                        .inferenceConfig(inferenceConfig)
+                        .build();
+                
+                // Make the API call using Converse
+                ConverseResponse response = bedrockClient.converse(converseRequest);
                 
                 // Parse response
-                String responseBody = response.body().asUtf8String();
-                return parseNovaResponse(responseBody, modelId);
+                return parseConverseResponse(response, modelId);
                 
             } catch (ResourceNotFoundException e) {
                 // Model not found - don't retry
@@ -252,32 +245,38 @@ public class NovaInvokerService {
     }
     
     /**
-     * Parse Nova model response
+     * Parse Converse API response
      */
-    private NovaResponse parseNovaResponse(String responseBody, String modelId) throws NovaInvokerException {
+    private NovaResponse parseConverseResponse(ConverseResponse response, String modelId) throws NovaInvokerException {
         try {
-            JsonNode root = objectMapper.readTree(responseBody);
-            
-            // Extract response content
-            JsonNode output = root.path("output");
-            JsonNode message = output.path("message");
-            JsonNode content = message.path("content");
-            
+            // Extract response text from Converse response
             String responseText = "";
-            if (content.isArray() && content.size() > 0) {
-                responseText = content.get(0).path("text").asText();
+            ConverseOutput output = response.output();
+            
+            if (output != null && output.message() != null) {
+                Message outputMessage = output.message();
+                if (outputMessage.content() != null && !outputMessage.content().isEmpty()) {
+                    ContentBlock firstContent = outputMessage.content().get(0);
+                    if (firstContent.text() != null) {
+                        responseText = firstContent.text();
+                    }
+                }
             }
             
-            // Extract usage information
-            JsonNode usage = root.path("usage");
-            int inputTokens = usage.path("inputTokens").asInt(0);
-            int outputTokens = usage.path("outputTokens").asInt(0);
-            int totalTokens = usage.path("totalTokens").asInt(inputTokens + outputTokens);
+            // Extract token usage
+            TokenUsage usage = response.usage();
+            int inputTokens = usage != null ? usage.inputTokens() : 0;
+            int outputTokens = usage != null ? usage.outputTokens() : 0;
+            int totalTokens = usage != null ? usage.totalTokens() : (inputTokens + outputTokens);
             
             // Calculate cost based on model
             double cost = calculateCost(modelId, inputTokens, outputTokens);
             
-            return NovaResponse.builder()
+            // Extract additional metadata if available
+            String stopReason = response.stopReason() != null ? 
+                response.stopReason().toString() : "COMPLETE";
+            
+            NovaResponse novaResponse = NovaResponse.builder()
                 .responseText(responseText)
                 .inputTokens(inputTokens)
                 .outputTokens(outputTokens)
@@ -287,9 +286,14 @@ public class NovaInvokerService {
                 .successful(true)
                 .timestamp(Instant.now().toEpochMilli())
                 .build();
+            
+            // Add stop reason to metadata
+            novaResponse.getMetadata().put("stopReason", stopReason);
+            
+            return novaResponse;
                 
         } catch (Exception e) {
-            throw new NovaInvokerException("Failed to parse Nova response: " + e.getMessage(), e);
+            throw new NovaInvokerException("Failed to parse Converse response: " + e.getMessage(), e);
         }
     }
     

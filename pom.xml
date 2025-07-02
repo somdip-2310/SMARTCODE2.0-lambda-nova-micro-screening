@@ -22,7 +22,7 @@
             <dependency>
                 <groupId>software.amazon.awssdk</groupId>
                 <artifactId>bom</artifactId>
-                <version>2.21.0</version>
+                <version>2.26.0</version> <!-- Updated to ensure full Converse API support -->
                 <type>pom</type>
                 <scope>import</scope>
             </dependency>

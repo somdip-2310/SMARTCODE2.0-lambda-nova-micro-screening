@@ -39,7 +39,7 @@ public class ScreeningHandler implements RequestHandler<ScreeningRequest, Screen
         ".*/coverage/.*", ".*\\.min\\.(js|css)$", ".*\\.generated\\.(java|cs)$"
     );
     
-    private static final long MAX_FILE_SIZE = 5 * 1024 * 1024; // 5MB
+    private static final long MAX_FILE_SIZE = 20 * 1024 * 1024; // 20MB
     
     public ScreeningHandler() {
         this.novaInvoker = new NovaInvokerService(BEDROCK_REGION);

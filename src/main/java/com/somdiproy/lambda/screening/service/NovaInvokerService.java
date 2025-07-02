@@ -53,21 +53,21 @@ public class NovaInvokerService {
      * Invoke Nova Micro model for file screening
      */
     public NovaResponse invokeNovaMicro(String prompt, NovaRequest request) throws NovaInvokerException {
-        return invokeNova("us.amazon.nova-micro-v1:0", prompt, request, 500);
+        return invokeNova("amazon.nova-micro-v1:0", prompt, request, 500);
     }
     
     /**
      * Invoke Nova Lite model for issue detection  
      */
     public NovaResponse invokeNovaLite(String prompt, NovaRequest request) throws NovaInvokerException {
-        return invokeNova("us.amazon.nova-lite-v1:0", prompt, request, 4000);
+        return invokeNova("amazon.nova-lite-v1:0", prompt, request, 4000);
     }
     
     /**
      * Invoke Nova Premier model for suggestion generation
      */
     public NovaResponse invokeNovaPremier(String prompt, NovaRequest request) throws NovaInvokerException {
-        return invokeNova("us.amazon.nova-pro-v1:0", prompt, request, 8000);
+        return invokeNova("amazon.nova-pro-v1:0", prompt, request, 8000);
     }
     
     /**
@@ -304,14 +304,14 @@ public class NovaInvokerService {
         double costPer1MTokens;
         
         switch (modelId) {
-            case "us.amazon.nova-micro-v1:0":
+            case "amazon.nova-micro-v1:0":
                 costPer1MTokens = 0.0075; // $0.0075 per 1M tokens
                 break;
-            case "us.amazon.nova-lite-v1:0":
+            case "amazon.nova-lite-v1:0":
                 costPer1MTokens = 0.015; // $0.015 per 1M tokens
                 break;
-            case "us.amazon.nova-pro-v1:0":
-            case "us.amazon.nova-premier-v1:0":
+            case "amazon.nova-pro-v1:0":
+            case "amazon.nova-premier-v1:0":
                 costPer1MTokens = 0.80; // $0.80 per 1M tokens
                 break;
             default:

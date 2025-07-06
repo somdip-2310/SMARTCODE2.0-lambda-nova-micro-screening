@@ -213,6 +213,9 @@ public class TokenOptimizer {
     /**
      * Preserve executable code while removing boilerplate
      */
+    /**
+     * Preserve executable code while removing boilerplate
+     */
     private static String preserveExecutableCode(String content, String language) {
         switch (language.toLowerCase()) {
             case "java":
@@ -220,39 +223,84 @@ public class TokenOptimizer {
             case "python":
                 return preservePythonExecutableCode(content);
             default:
-                return content;
+                return preserveExecutableCodeWithLineNumbers(content);
         }
     }
+
+    /**
+     * Preserve executable code with line numbers for better issue detection
+     */
+    private static String preserveExecutableCodeWithLineNumbers(String content) {
+        StringBuilder result = new StringBuilder();
+        String[] lines = content.split("\n");
+        int actualLineNumber = 1;
+        
+        for (String line : lines) {
+            String trimmed = line.trim();
+            // Skip empty lines and comments but count them
+            if (!trimmed.isEmpty() && !trimmed.startsWith("//") && !trimmed.startsWith("#")) {
+                // Add line number as comment at the end of meaningful lines
+                result.append(line).append(" // L").append(actualLineNumber).append("\n");
+            }
+            actualLineNumber++;
+        }
+        
+        return result.toString();
+    }
+    
     
     /**
-     * Preserve Java executable code patterns
+     * Preserve Java executable code patterns with line numbers
      */
     private static String preserveJavaExecutableCode(String content) {
-        return content.lines()
-            .filter(line -> {
-                String trimmed = line.trim();
-                return !trimmed.isEmpty() && 
-                       !trimmed.startsWith("import") &&
-                       !trimmed.startsWith("package") &&
-                       !trimmed.matches("^\\s*\\}\\s*$") &&
-                       !trimmed.matches("^\\s*\\{\\s*$");
-            })
-            .reduce("", (a, b) -> a + "\n" + b);
+        StringBuilder result = new StringBuilder();
+        String[] lines = content.split("\n");
+        
+        for (int i = 0; i < lines.length; i++) {
+            String line = lines[i];
+            String trimmed = line.trim();
+            int lineNumber = i + 1;
+            
+            if (!trimmed.isEmpty() && 
+                !trimmed.startsWith("import") &&
+                !trimmed.startsWith("package") &&
+                !trimmed.matches("^\\s*\\}\\s*$") &&
+                !trimmed.matches("^\\s*\\{\\s*$")) {
+                
+                // Add line number comment for Java
+                result.append(line).append(" // Line ").append(lineNumber).append("\n");
+            }
+        }
+        
+        return result.toString();
     }
     
     /**
      * Preserve Python executable code patterns
      */
+    /**
+     * Preserve Python executable code patterns with line numbers
+     */
     private static String preservePythonExecutableCode(String content) {
-        return content.lines()
-            .filter(line -> {
-                String trimmed = line.trim();
-                return !trimmed.isEmpty() && 
-                       !trimmed.startsWith("import") &&
-                       !trimmed.startsWith("from") &&
-                       trimmed.length() > 5; // Skip very short lines
-            })
-            .reduce("", (a, b) -> a + "\n" + b);
+        StringBuilder result = new StringBuilder();
+        String[] lines = content.split("\n");
+        
+        for (int i = 0; i < lines.length; i++) {
+            String line = lines[i];
+            String trimmed = line.trim();
+            int lineNumber = i + 1;
+            
+            if (!trimmed.isEmpty() && 
+                !trimmed.startsWith("import") &&
+                !trimmed.startsWith("from") &&
+                trimmed.length() > 5) {
+                
+                // Add line number comment for Python
+                result.append(line).append(" # Line ").append(lineNumber).append("\n");
+            }
+        }
+        
+        return result.toString();
     }
     
     /**
